@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import json
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -54,7 +55,33 @@ def check(case, result, runtime):
     return failures
 
 
-def run(prompts, model, category):
+def _is_rate_limit(exc: Exception) -> bool:
+    text = str(exc)
+    return "429" in text or "RESOURCE_EXHAUSTED" in text or "rate" in text.lower()
+
+
+def _run_case(agent, case, runtime, retries=6):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            result = agent.run(case["input"])
+            failures = check(case, result, runtime)
+            return failures, result.run_id
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit(e) and attempt < retries - 1:
+                wait = 25 + attempt * 10
+                print(f"  rate-limited, sleeping {wait}s...")
+                time.sleep(wait)
+                continue
+            if "503" in str(e) and attempt < retries - 1:
+                time.sleep(15)
+                continue
+            return [f"exception: {type(e).__name__}: {e}"], None
+    return [f"exception: {type(last_err).__name__}: {last_err}"], None
+
+
+def run(prompts, model, category, pause_s=14):
     tracer = Tracer()
     cases = load_cases(category)
     rows = []
@@ -62,17 +89,15 @@ def run(prompts, model, category):
         for case in cases:
             runtime = ToolRuntime(case.get("customer_id", "C001"), faults=case.get("faults"))
             agent = SupportAgent(runtime, prompt_version=prompt, model=model, tracer=tracer)
-            try:
-                result = agent.run(case["input"])
-                failures = check(case, result, runtime)
-                run_id = result.run_id
-            except Exception as e:  # API errors etc. count as failures, don't kill the run
-                failures, run_id = [f"exception: {type(e).__name__}: {e}"], None
+            failures, run_id = _run_case(agent, case, runtime)
             passed = not failures
             rows.append({"prompt": prompt, "id": case["id"], "category": case["category"],
                          "passed": passed, "failures": failures, "run_id": run_id})
             print(f"[{prompt}] {'PASS' if passed else 'FAIL'}  {case['id']}"
-                  + ("" if passed else f"  -> {failures[0]}"))
+                  + ("" if passed else f"  -> {failures[0][:160]}"))
+            # Free-tier Gemini is ~5 RPM; pause between cases to stay under it.
+            if pause_s > 0:
+                time.sleep(pause_s)
     return rows, len(cases)
 
 
@@ -130,11 +155,13 @@ def main():
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--only", help="run a single category")
     p.add_argument("--out", default="reports")
+    p.add_argument("--pause", type=float, default=14,
+                   help="seconds to sleep between cases (free-tier rate limits)")
     p.add_argument("--fail-under", type=float, default=0,
                    help="exit 1 if the last prompt's overall pass rate is below this (0-100)")
     args = p.parse_args()
 
-    rows, n_cases = run(args.prompts, args.model, args.only)
+    rows, n_cases = run(args.prompts, args.model, args.only, pause_s=args.pause)
     path, by = write_report(rows, args.prompts, args.model, n_cases, Path(args.out))
     print(f"\nreport: {path}")
 

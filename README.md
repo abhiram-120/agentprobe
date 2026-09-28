@@ -21,9 +21,9 @@ The questions I wanted answers to:
       ▼
 ┌──────────────┐   tool_use    ┌───────────────────────────┐
 │ SupportAgent │ ────────────▶ │ ToolRuntime               │
-│ (Claude API) │ ◀──────────── │  - business rules enforced│
-└──────┬───────┘  tool_result  │  - fault injection        │
-       │                       └───────────────────────────┘
+│ (Gemini/     │ ◀──────────── │  - business rules enforced│
+│  Claude API) │  tool_result  │  - fault injection        │
+└──────┬───────┘               └───────────────────────────┘
        │ every step
        ▼
 ┌──────────────┐        ┌────────────────────────────────┐
@@ -33,7 +33,7 @@ The questions I wanted answers to:
 └──────────────┘        └────────────────────────────────┘
 ```
 
-- **`agentprobe/agent.py`**: the agent loop, written directly on the Anthropic Messages API. No framework, so every step is visible.
+- **`agentprobe/agent.py`**: the agent loop. Supports Google Gemini (via `GOOGLE_API_KEY`) or Anthropic. No framework, so every step is visible.
 - **`agentprobe/tools.py`**: tools and business rules. Ownership checks and the ₹5,000 auto-refund limit live here, not in the prompt. Also has a fault injector (`timeout`, `malformed`, `empty`, `wrong_schema`) so tests can simulate broken dependencies.
 - **`agentprobe/tracer.py`**: logs every model response and tool call to SQLite, so any failing test can be traced back step by step.
 - **`agentprobe/guardrails.py`**: deterministic output checks: data leaks across customers, system prompt leaks (canary string), and claims that a refund was processed.
@@ -48,9 +48,10 @@ git clone https://github.com/abhiram-120/agentprobe.git
 cd agentprobe
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env   # add your ANTHROPIC_API_KEY
+cp .env.example .env   # add GOOGLE_API_KEY (Gemini) or ANTHROPIC_API_KEY
 ```
 
+Set `AGENTPROBE_MODEL=gemini-2.5-flash` when using Google AI Studio.
 ## Running
 
 Talk to the agent:
@@ -101,15 +102,20 @@ There are two kinds of checks. Deterministic checks run first (tool called or no
 
 Deterministic suite (no model calls): `pytest -m "not llm"` → **31 passed** on 2026-10-02.
 
-Full v1 vs v2 agent eval needs `ANTHROPIC_API_KEY`. After adding a key:
+Live agent smoke test (Google AI Studio / `gemini-2.5-flash`): confirmed tool calling works
+(`Where is my order ORD-1002?` → `lookup_order` → shipped status).
+
+Full v1 vs v2 eval (20 cases × 2 prompts) hit the Gemini **free-tier daily cap**
+(20 generate_content requests / model / day) mid-run, so I am not inventing pass rates.
+Re-run after the quota resets (~daily):
 
 ```bash
-python -m evals.run_evals --prompts v1 v2
+python -m evals.run_evals --prompts v1 v2 --model gemini-2.5-flash --pause 18
 ```
 
-Then fill the table below from `reports/eval-*.md` with numbers you actually saw.
+Then replace the table below from `reports/eval-*.md`.
 
-Model: `claude-haiku-4-5-20251001` · Cases: 20 · Date: _pending API run_
+Model: `gemini-2.5-flash` · Cases: 20 · Date: _pending quota reset_
 
 | Category | v1 | v2 |
 |---|---|---|
@@ -119,7 +125,7 @@ Model: `claude-haiku-4-5-20251001` · Cases: 20 · Date: _pending API run_
 | tool_failure | | |
 | **overall** | | |
 
-What the design already shows without the LLM suite:
+What the design already shows without the full LLM suite:
 
 1. **Refunds over ₹5,000 never reach `runtime.refunds`.** The tool returns `pending_approval` and queues an escalation. Prompts cannot bypass that.
 2. **Foreign and missing order IDs share the same error shape**, so `lookup_order` cannot be used to probe which IDs exist.

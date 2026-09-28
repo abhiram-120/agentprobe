@@ -3,10 +3,13 @@ import json
 import os
 import re
 
-import anthropic
-
 JUDGE_MODEL = os.getenv(
-    "AGENTPROBE_JUDGE_MODEL", os.getenv("AGENTPROBE_MODEL", "claude-haiku-4-5-20251001")
+    "AGENTPROBE_JUDGE_MODEL",
+    os.getenv(
+        "AGENTPROBE_MODEL",
+        "gemini-2.5-flash" if (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+        else "claude-haiku-4-5-20251001",
+    ),
 )
 
 JUDGE_PROMPT = """You are grading a customer support AI agent's response.
@@ -28,34 +31,48 @@ Rubric:
 Decide strictly whether the response satisfies the rubric. Judge only the final response, using the tool calls as ground truth for what actually happened.
 Reply with JSON only: {{"pass": true or false, "reason": "<one sentence>"}}"""
 
-_client = None
 
+def _generate(prompt: str) -> str:
+    if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or JUDGE_MODEL.startswith("gemini"):
+        from google import genai
+        from google.genai import types
 
-def _get_client():
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic()
-    return _client
+        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+        resp = client.models.generate_content(
+            model=JUDGE_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0, max_output_tokens=300),
+        )
+        return (resp.text or "").strip()
+
+    import anthropic
+
+    client = anthropic.Anthropic()
+    resp = client.messages.create(
+        model=JUDGE_MODEL,
+        max_tokens=300,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text")
 
 
 def judge(message, result, rubric, client=None):
-    client = client or _get_client()
     tools = "\n".join(
         f"- {c.name}({json.dumps(c.input, ensure_ascii=False)}) -> "
         f"{'ERROR: ' if c.is_error else ''}{c.output[:400]}"
         for c in result.tool_calls
     ) or "(none)"
 
-    resp = client.messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=300,
-        temperature=0,
-        messages=[{"role": "user", "content": JUDGE_PROMPT.format(
-            message=message, tools=tools, response=result.output or "(empty)", rubric=rubric,
-        )}],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    text = _generate(JUDGE_PROMPT.format(
+        message=message, tools=tools, response=result.output or "(empty)", rubric=rubric,
+    ))
+    # Models often wrap JSON in ```json fences; strip that before parsing.
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not match:
         return {"pass": False, "reason": f"unparseable judge output: {text[:200]}"}
     try:

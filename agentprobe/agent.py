@@ -1,5 +1,6 @@
-"""A small tool-calling support agent built directly on the Anthropic Messages API.
+"""A small tool-calling support agent.
 
+Uses Google Gemini when GOOGLE_API_KEY is set, otherwise Anthropic.
 No framework on purpose: every step of the loop is visible and gets traced.
 """
 import os
@@ -7,13 +8,19 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import anthropic
-
 from .tools import TOOL_SCHEMAS, ToolRuntime
 from .tracer import Tracer
 
-DEFAULT_MODEL = os.getenv("AGENTPROBE_MODEL", "claude-haiku-4-5-20251001")
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+
+def _default_model():
+    if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
+        return os.getenv("AGENTPROBE_MODEL", "gemini-2.5-flash")
+    return os.getenv("AGENTPROBE_MODEL", "claude-haiku-4-5-20251001")
+
+
+DEFAULT_MODEL = _default_model()
 
 
 @dataclass
@@ -35,18 +42,122 @@ class AgentResult:
         return [c for c in self.tool_calls if c.name == name]
 
 
+def _gemini_tools():
+    from google.genai import types
+
+    decls = []
+    for schema in TOOL_SCHEMAS:
+        decls.append(types.FunctionDeclaration(
+            name=schema["name"],
+            description=schema.get("description", ""),
+            parameters=schema.get("input_schema") or {"type": "object", "properties": {}},
+        ))
+    return [types.Tool(function_declarations=decls)]
+
+
 class SupportAgent:
-    def __init__(self, runtime: ToolRuntime, prompt_version="v2", model=DEFAULT_MODEL,
+    def __init__(self, runtime: ToolRuntime, prompt_version="v2", model=None,
                  tracer=None, max_steps=6, client=None):
         self.runtime = runtime
         self.prompt_version = prompt_version
-        self.model = model
+        self.model = model or DEFAULT_MODEL
         self.system = (PROMPTS_DIR / f"{prompt_version}.txt").read_text(encoding="utf-8")
         self.tracer = tracer or Tracer()
         self.max_steps = max_steps
-        self.client = client or anthropic.Anthropic()
+        self.client = client
+        self._backend = "gemini" if (
+            self.model.startswith("gemini")
+            or os.getenv("GOOGLE_API_KEY")
+            or os.getenv("GEMINI_API_KEY")
+        ) and not self.model.startswith("claude") else "anthropic"
 
     def run(self, user_message: str) -> AgentResult:
+        if self._backend == "gemini":
+            return self._run_gemini(user_message)
+        return self._run_anthropic(user_message)
+
+    def _run_gemini(self, user_message: str) -> AgentResult:
+        from google import genai
+        from google.genai import types
+
+        client = self.client or genai.Client(
+            api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        )
+        run_id = self.tracer.start_run(self.model, self.prompt_version, user_message)
+        contents = [
+            types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
+        ]
+        calls = []
+        tokens_in = tokens_out = 0
+        started = time.monotonic()
+        config = types.GenerateContentConfig(
+            system_instruction=self.system,
+            tools=_gemini_tools(),
+            temperature=0,
+            max_output_tokens=1024,
+        )
+
+        for _ in range(self.max_steps):
+            resp = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+            usage = getattr(resp, "usage_metadata", None)
+            if usage:
+                tokens_in += int(getattr(usage, "prompt_token_count", 0) or 0)
+                tokens_out += int(getattr(usage, "candidates_token_count", 0) or 0)
+
+            candidate = (resp.candidates or [None])[0]
+            if candidate is None or candidate.content is None:
+                text = (resp.text or "").strip()
+                return self._finish(run_id, text, "ok", calls, started, tokens_in, tokens_out)
+
+            parts = candidate.content.parts or []
+            fn_calls = [p for p in parts if getattr(p, "function_call", None)]
+            text_parts = [p.text for p in parts if getattr(p, "text", None)]
+
+            self.tracer.log_step(run_id, "model", {
+                "stop_reason": "tool_use" if fn_calls else "end_turn",
+                "content": [
+                    {"type": "tool_use", "name": p.function_call.name,
+                     "input": dict(p.function_call.args or {})}
+                    if getattr(p, "function_call", None)
+                    else {"type": "text", "text": p.text or ""}
+                    for p in parts
+                ],
+            })
+            contents.append(candidate.content)
+
+            if not fn_calls:
+                text = "".join(text_parts).strip()
+                return self._finish(run_id, text, "ok", calls, started, tokens_in, tokens_out)
+
+            result_parts = []
+            for p in fn_calls:
+                name = p.function_call.name
+                args = dict(p.function_call.args or {})
+                output, is_error = self.runtime.call(name, args)
+                calls.append(ToolCall(name, args, output, is_error))
+                self.tracer.log_step(run_id, "tool", {
+                    "name": name,
+                    "input": args,
+                    "output": output,
+                    "is_error": is_error,
+                })
+                # Gemini expects a JSON-serializable response object, not a raw string.
+                payload = {"result": output, "is_error": is_error}
+                result_parts.append(
+                    types.Part.from_function_response(name=name, response=payload)
+                )
+            contents.append(types.Content(role="user", parts=result_parts))
+
+        return self._finish(run_id, "", "max_steps", calls, started, tokens_in, tokens_out)
+
+    def _run_anthropic(self, user_message: str) -> AgentResult:
+        import anthropic
+
+        client = self.client or anthropic.Anthropic()
         run_id = self.tracer.start_run(self.model, self.prompt_version, user_message)
         messages = [{"role": "user", "content": user_message}]
         calls = []
@@ -54,7 +165,7 @@ class SupportAgent:
         started = time.monotonic()
 
         for _ in range(self.max_steps):
-            resp = self.client.messages.create(
+            resp = client.messages.create(
                 model=self.model,
                 max_tokens=1024,
                 temperature=0,
@@ -94,7 +205,6 @@ class SupportAgent:
                 })
             messages.append({"role": "user", "content": results})
 
-        # ran out of steps without a final answer
         return self._finish(run_id, "", "max_steps", calls, started, tokens_in, tokens_out)
 
     def _finish(self, run_id, text, status, calls, started, tokens_in, tokens_out):
