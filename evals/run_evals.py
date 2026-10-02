@@ -71,10 +71,10 @@ def _run_case(agent, case, runtime, retries=6):
             last_err = e
             if _is_rate_limit(e) and attempt < retries - 1:
                 wait = 25 + attempt * 10
-                print(f"  rate-limited, sleeping {wait}s...")
+                print(f"  rate-limited, sleeping {wait}s...", flush=True)
                 time.sleep(wait)
                 continue
-            if "503" in str(e) and attempt < retries - 1:
+            if ("503" in str(e) or "429" in str(e)) and attempt < retries - 1:
                 time.sleep(15)
                 continue
             return [f"exception: {type(e).__name__}: {e}"], None

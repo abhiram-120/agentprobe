@@ -8,9 +8,14 @@ from agentprobe.tracer import Tracer
 
 
 def pytest_collection_modifyitems(config, items):
-    if os.getenv("ANTHROPIC_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
+    if (
+        os.getenv("ANTHROPIC_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GROQ_API_KEY")
+    ):
         return
-    skip = pytest.mark.skip(reason="ANTHROPIC_API_KEY or GOOGLE_API_KEY not set")
+    skip = pytest.mark.skip(reason="ANTHROPIC_API_KEY, GOOGLE_API_KEY, or GROQ_API_KEY not set")
     for item in items:
         if "llm" in item.keywords:
             item.add_marker(skip)

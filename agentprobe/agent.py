@@ -1,8 +1,9 @@
 """A small tool-calling support agent.
 
-Uses Google Gemini when GOOGLE_API_KEY is set, otherwise Anthropic.
+Backends: local heuristic, Groq (OpenAI-compatible), Google Gemini, or Anthropic.
 No framework on purpose: every step of the loop is visible and gets traced.
 """
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -18,11 +19,12 @@ def _default_model():
     backend = os.getenv("AGENTPROBE_BACKEND", "").lower()
     if backend == "local" or os.getenv("AGENTPROBE_MODEL", "").startswith("local"):
         return os.getenv("AGENTPROBE_MODEL", "local-heuristic")
+    if backend == "groq" or os.getenv("GROQ_API_KEY"):
+        return os.getenv("AGENTPROBE_MODEL", "openai/gpt-oss-20b")
     if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
         return os.getenv("AGENTPROBE_MODEL", "gemini-2.5-flash")
     if os.getenv("ANTHROPIC_API_KEY"):
         return os.getenv("AGENTPROBE_MODEL", "claude-haiku-4-5-20251001")
-    # No cloud key: run the local heuristic agent so the harness still works offline.
     return os.getenv("AGENTPROBE_MODEL", "local-heuristic")
 
 
@@ -31,10 +33,12 @@ DEFAULT_MODEL = _default_model()
 
 def _pick_backend(model: str) -> str:
     forced = os.getenv("AGENTPROBE_BACKEND", "").lower()
-    if forced in ("local", "gemini", "anthropic"):
+    if forced in ("local", "gemini", "anthropic", "groq"):
         return forced
     if model.startswith("local"):
         return "local"
+    if os.getenv("GROQ_API_KEY") or model.startswith(("openai/", "qwen/", "meta-llama/")):
+        return "groq"
     if model.startswith("gemini") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
         if not model.startswith("claude"):
             return "gemini"
@@ -58,6 +62,20 @@ class AgentResult:
 
     def called(self, name):
         return [c for c in self.tool_calls if c.name == name]
+
+
+def _openai_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": schema["name"],
+                "description": schema.get("description", ""),
+                "parameters": schema.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        }
+        for schema in TOOL_SCHEMAS
+    ]
 
 
 def _gemini_tools():
@@ -95,9 +113,101 @@ class SupportAgent:
                 tracer=self.tracer,
                 max_steps=self.max_steps,
             ).run(user_message)
+        if self._backend == "groq":
+            return self._run_groq(user_message)
         if self._backend == "gemini":
             return self._run_gemini(user_message)
         return self._run_anthropic(user_message)
+
+    def _run_groq(self, user_message: str) -> AgentResult:
+        from openai import OpenAI
+
+        client = self.client or OpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1",
+        )
+        run_id = self.tracer.start_run(self.model, self.prompt_version, user_message)
+        messages = [
+            {"role": "system", "content": self.system},
+            {"role": "user", "content": user_message},
+        ]
+        calls = []
+        tokens_in = tokens_out = 0
+        started = time.monotonic()
+        tools = _openai_tools()
+
+        for _ in range(self.max_steps):
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                temperature=0,
+                max_tokens=1024,
+            )
+            usage = resp.usage
+            if usage:
+                tokens_in += int(usage.prompt_tokens or 0)
+                tokens_out += int(usage.completion_tokens or 0)
+
+            msg = resp.choices[0].message
+            tool_calls = msg.tool_calls or []
+            self.tracer.log_step(run_id, "model", {
+                "stop_reason": "tool_use" if tool_calls else "end_turn",
+                "content": (
+                    [
+                        {
+                            "type": "tool_use",
+                            "name": tc.function.name,
+                            "input": json.loads(tc.function.arguments or "{}"),
+                        }
+                        for tc in tool_calls
+                    ]
+                    if tool_calls
+                    else [{"type": "text", "text": msg.content or ""}]
+                ),
+            })
+
+            assistant_msg = {"role": "assistant", "content": msg.content}
+            if tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                return self._finish(
+                    run_id, (msg.content or "").strip(), "ok", calls, started, tokens_in, tokens_out
+                )
+
+            for tc in tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                output, is_error = self.runtime.call(name, args)
+                calls.append(ToolCall(name, dict(args), output, is_error))
+                self.tracer.log_step(run_id, "tool", {
+                    "name": name,
+                    "input": args,
+                    "output": output,
+                    "is_error": is_error,
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": output,
+                })
+
+        return self._finish(run_id, "", "max_steps", calls, started, tokens_in, tokens_out)
 
     def _run_gemini(self, user_message: str) -> AgentResult:
         from google import genai
@@ -168,7 +278,6 @@ class SupportAgent:
                     "output": output,
                     "is_error": is_error,
                 })
-                # Gemini expects a JSON-serializable response object, not a raw string.
                 payload = {"result": output, "is_error": is_error}
                 result_parts.append(
                     types.Part.from_function_response(name=name, response=payload)

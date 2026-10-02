@@ -13,6 +13,8 @@ def _default_judge_model():
         return os.getenv("AGENTPROBE_JUDGE_MODEL")
     if os.getenv("AGENTPROBE_BACKEND", "").lower() == "local":
         return "local-heuristic"
+    if os.getenv("GROQ_API_KEY") or os.getenv("AGENTPROBE_BACKEND", "").lower() == "groq":
+        return os.getenv("AGENTPROBE_MODEL", "openai/gpt-oss-20b")
     if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
         return os.getenv("AGENTPROBE_MODEL", "gemini-2.5-flash")
     if os.getenv("ANTHROPIC_API_KEY"):
@@ -173,6 +175,18 @@ def _generate(prompt: str) -> str:
     if JUDGE_MODEL.startswith("local") or os.getenv("AGENTPROBE_BACKEND", "").lower() == "local":
         return ""  # unused; local_judge path below
 
+    if os.getenv("GROQ_API_KEY") or os.getenv("AGENTPROBE_BACKEND", "").lower() == "groq" or JUDGE_MODEL.startswith(("openai/", "qwen/")):
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
+        resp = client.chat.completions.create(
+            model=JUDGE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=300,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
     if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or JUDGE_MODEL.startswith("gemini"):
         from google import genai
         from google.genai import types
@@ -200,7 +214,12 @@ def _generate(prompt: str) -> str:
 def judge(message, result, rubric, client=None):
     if JUDGE_MODEL.startswith("local") or os.getenv("AGENTPROBE_BACKEND", "").lower() == "local":
         return _local_judge(message, result, rubric)
-    if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
+    if not (
+        os.getenv("GROQ_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("ANTHROPIC_API_KEY")
+    ):
         return _local_judge(message, result, rubric)
 
     tools = "\n".join(
