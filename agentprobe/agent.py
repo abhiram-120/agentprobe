@@ -15,12 +15,30 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
 def _default_model():
+    backend = os.getenv("AGENTPROBE_BACKEND", "").lower()
+    if backend == "local" or os.getenv("AGENTPROBE_MODEL", "").startswith("local"):
+        return os.getenv("AGENTPROBE_MODEL", "local-heuristic")
     if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
         return os.getenv("AGENTPROBE_MODEL", "gemini-2.5-flash")
-    return os.getenv("AGENTPROBE_MODEL", "claude-haiku-4-5-20251001")
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return os.getenv("AGENTPROBE_MODEL", "claude-haiku-4-5-20251001")
+    # No cloud key: run the local heuristic agent so the harness still works offline.
+    return os.getenv("AGENTPROBE_MODEL", "local-heuristic")
 
 
 DEFAULT_MODEL = _default_model()
+
+
+def _pick_backend(model: str) -> str:
+    forced = os.getenv("AGENTPROBE_BACKEND", "").lower()
+    if forced in ("local", "gemini", "anthropic"):
+        return forced
+    if model.startswith("local"):
+        return "local"
+    if model.startswith("gemini") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
+        if not model.startswith("claude"):
+            return "gemini"
+    return "anthropic"
 
 
 @dataclass
@@ -65,13 +83,18 @@ class SupportAgent:
         self.tracer = tracer or Tracer()
         self.max_steps = max_steps
         self.client = client
-        self._backend = "gemini" if (
-            self.model.startswith("gemini")
-            or os.getenv("GOOGLE_API_KEY")
-            or os.getenv("GEMINI_API_KEY")
-        ) and not self.model.startswith("claude") else "anthropic"
+        self._backend = _pick_backend(self.model)
 
     def run(self, user_message: str) -> AgentResult:
+        if self._backend == "local":
+            from .local_agent import LocalSupportAgent
+            return LocalSupportAgent(
+                self.runtime,
+                prompt_version=self.prompt_version,
+                model=self.model if self.model.startswith("local") else "local-heuristic",
+                tracer=self.tracer,
+                max_steps=self.max_steps,
+            ).run(user_message)
         if self._backend == "gemini":
             return self._run_gemini(user_message)
         return self._run_anthropic(user_message)
